@@ -8,76 +8,75 @@ import 'package:flutter/material.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
 /// An interceptor for handling Cloudflare challenges in Dio requests.
-/// 
+///
 /// This interceptor detects Cloudflare challenges in responses and errors,
 /// and attempts to solve them using a WebView. If the challenge is solved,
 /// it retries the request with the solved data.
-/// 
+///
 /// The interceptor requires a [Dio] instance, a [CookieJar] for storing cookies,
 /// and a [BuildContext] for displaying a WebView dialog if necessary.
-/// 
+///
 /// Example usage:
 /// ```dart
 /// final dio = Dio();
 /// final cookieJar = CookieJar();
 /// final context = ...; // Obtain a BuildContext
-/// 
+///
 /// dio.interceptors.add(CloudflareInterceptor(
 ///   dio: dio,
 ///   cookieJar: cookieJar,
 ///   context: context,
 /// ));
 /// ```
-/// 
+///
 /// The interceptor overrides the [onResponse] and [onError] methods to handle
 /// Cloudflare challenges. If a challenge is detected, it calls [solveCloudflare]
 /// to solve the challenge using a WebView.
-/// 
+///
 /// The [solveCloudflare] method initializes a headless WebView to solve the challenge.
 /// If the challenge is not solved within 5 seconds, it displays a fullscreen dialog
 /// with the WebView to allow the user to solve the challenge manually.
-/// 
+///
 /// The [onLoadStop] method is called when the WebView finishes loading a page.
 /// It checks if the challenge is solved by examining the page title and cookies.
 /// If the challenge is solved, it completes the [_completer] with the solved data
 /// and dismisses the dialog if it was displayed.
-class CloudflareInterceptor extends Interceptor {
+
+class CloudflareInterceptor extends QueuedInterceptorsWrapper {
   /// An instance of the Dio HTTP client used to make network requests.
   final Dio dio;
 
   /// A `CookieJar` instance used to manage cookies for HTTP requests and responses.
   final CookieJar cookieJar;
 
-  /// The [BuildContext] associated with this interceptor.
+  /// The [BuildContext] associated with this queued interceptor.
   /// This context is used to access the widget tree and other context-specific information.
   final BuildContext context;
 
   Completer<String?> _completer = Completer<String?>.sync();
+  bool _solvingChallenge = false;
   bool _usingDialog = false;
 
-  /// Interceptor for handling Cloudflare challenges.
+  /// QueuedInterceptor for handling Cloudflare challenges.
   ///
-  /// This interceptor is responsible for managing the interaction with Cloudflare's
+  /// This queued interceptor is responsible for managing the interaction with Cloudflare's
   /// challenge pages, ensuring that requests can be made successfully.
   ///
   /// Parameters:
   /// - `dio`: The Dio instance used for making HTTP requests.
   /// - `cookieJar`: The CookieJar instance used for managing cookies.
   /// - `context`: The BuildContext instance used for accessing the widget tree.
-  CloudflareInterceptor({
-    required this.dio, 
-    required this.cookieJar, 
-    required this.context
-  });
+  CloudflareInterceptor(
+      {required this.dio, required this.cookieJar, required this.context});
 
   /// Intercepts the response to check if it is a Cloudflare challenge.
-  /// 
+  ///
   /// If the response is identified as a Cloudflare challenge, it attempts to solve the challenge using a WebView.
   /// Upon solving the challenge, it creates a new response with the solved data and passes it to the next handler.
   /// If an error occurs while solving the challenge, it rejects the response with the error.
-  /// 
+  ///
   /// If the response is not a Cloudflare challenge, it proceeds as normal.
-  /// 
+  ///
   /// @param response The intercepted response.
   /// @param handler The handler to pass the response to the next interceptor or to reject it.
   @override
@@ -89,9 +88,19 @@ class CloudflareInterceptor extends Interceptor {
       return;
     }
 
-    // Solve challenge using a WebView
+    // Solve challenge using a WebView (ensure we're not already doing this for another request)
+    if (!_solvingChallenge) {
+      _solvingChallenge = true;
+      try {
+        _solveCloudflare(response.requestOptions);
+      } catch (e) {
+        _completer.completeError(e);
+      } finally {
+        _solvingChallenge = false;
+      }
+    }
+
     try {
-      _solveCloudflare(response.requestOptions);
       final solvedData = await _completer.future;
       if (solvedData != null) {
         final newResponse = Response(
@@ -103,32 +112,47 @@ class CloudflareInterceptor extends Interceptor {
         handler.next(newResponse);
       }
     } catch (e) {
-      handler.reject(DioException(requestOptions: response.requestOptions, error: e));
+      handler.reject(
+          DioException(requestOptions: response.requestOptions, error: e));
     }
   }
 
   /// Intercepts errors and checks if the error response is a Cloudflare challenge.
   /// If it is, attempts to solve the challenge and retry the request with the solved data.
-  /// 
+  ///
   /// If the challenge is solved successfully, a new response with the solved data is created
   /// and the handler resolves it. If an error occurs during the solving process, the handler
   /// rejects the error.
-  /// 
+  ///
   /// If the error is not a Cloudflare challenge, the error is passed to the next handler.
-  /// 
+  ///
   /// - Parameters:
   ///   - err: The error that occurred during the request.
   ///   - handler: The error interceptor handler to manage the error.
   @override
   void onError(DioException err, ErrorInterceptorHandler handler) async {
     final cfMitigated = err.response?.headers['cf-mitigated'];
-    if (err.response == null || cfMitigated == null || !cfMitigated.contains('challenge')) {
+    if (err.response == null ||
+        cfMitigated == null ||
+        !cfMitigated.contains('challenge')) {
+      // If not a Cloudflare challenge, proceed as normal
       handler.next(err);
       return;
     }
 
+    // Solve challenge using a WebView (ensure we're not already doing this for another request)
+    if (!_solvingChallenge) {
+      _solvingChallenge = true;
+      try {
+        _solveCloudflare(err.requestOptions);
+      } catch (e) {
+        _completer.completeError(e);
+      } finally {
+        _solvingChallenge = false;
+      }
+    }
+
     try {
-      _solveCloudflare(err.requestOptions);
       final solvedData = await _completer.future;
       if (solvedData != null) {
         final newResponse = Response(
@@ -140,7 +164,8 @@ class CloudflareInterceptor extends Interceptor {
         handler.resolve(newResponse);
       }
     } catch (e) {
-      handler.reject(DioException(requestOptions: err.requestOptions, error: e));
+      handler
+          .reject(DioException(requestOptions: err.requestOptions, error: e));
     }
   }
 
@@ -152,17 +177,15 @@ class CloudflareInterceptor extends Interceptor {
     final initialUrlRequest = await requestOptions.getURLRequest();
 
     final headlessWebView = HeadlessInAppWebView(
-			initialSettings: initialSettings,
-			initialUrlRequest: initialUrlRequest,
-			onLoadStop: _onLoadStop,
-		);
+      initialSettings: initialSettings,
+      initialUrlRequest: initialUrlRequest,
+      onLoadStop: _onLoadStop,
+    );
 
     await headlessWebView.run();
 
-    await Future.any([
-			_completer.future,
-			Future.delayed(const Duration(seconds: 5))
-		]);
+    await Future.any(
+        [_completer.future, Future.delayed(const Duration(seconds: 5))]);
 
     if (_completer.isCompleted) {
       headlessWebView.dispose();
@@ -172,16 +195,14 @@ class CloudflareInterceptor extends Interceptor {
     if (!context.mounted) throw Exception('Context is not mounted');
 
     showDialog(
-      context: context, 
-      builder: (context) => Dialog.fullscreen(
-        child: InAppWebView(
-		  		headlessWebView: headlessWebView,
-		  		initialSettings: initialSettings,
-		  		initialUrlRequest: initialUrlRequest,
-		  		onLoadStop: _onLoadStop,
-		  	)
-      )
-    );
+        context: context,
+        builder: (context) => Dialog.fullscreen(
+                child: InAppWebView(
+              headlessWebView: headlessWebView,
+              initialSettings: initialSettings,
+              initialUrlRequest: initialUrlRequest,
+              onLoadStop: _onLoadStop,
+            )));
 
     _usingDialog = true;
   }
@@ -196,11 +217,8 @@ class CloudflareInterceptor extends Interceptor {
     );
 
     // If the title no longer matches challenge keywords, we consider it solved.
-    if (
-      title == null || 
-      title.contains(pattern)
-    ) return;
-    
+    if (title == null || title.contains(pattern)) return;
+
     // Get cookies from the WebView (InAppWebViewCookie)
     final inAppCookies = await CookieManager.instance().getCookies(url: uri!);
 
@@ -227,7 +245,7 @@ class CloudflareInterceptor extends Interceptor {
     // Dismiss the dialog
     if (_usingDialog) {
       if (!context.mounted) throw Exception('Context is not mounted');
-      
+
       Navigator.of(context).pop();
 
       _usingDialog = false;

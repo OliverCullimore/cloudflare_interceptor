@@ -224,9 +224,6 @@ class CloudflareInterceptor extends Interceptor {
     final html = await controller.getHtml();
     if (html == null) throw Exception('Failed to get HTML content');
 
-    // Complete the challenge
-    _completer.complete(html);
-
     // Dismiss the dialog
     if (_usingDialog) {
       if (!context.mounted) throw Exception('Context is not mounted');
@@ -235,5 +232,8 @@ class CloudflareInterceptor extends Interceptor {
 
       _usingDialog = false;
     }
+
+    // Complete the challenge
+    _completer.complete(html);
   }
 }
